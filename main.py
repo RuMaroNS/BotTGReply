@@ -1,51 +1,48 @@
-import asyncio
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-import os
+const TelegramBot = require('node-telegram-bot-api');
+const { createClient } = require('@supabase/supabase-js');
 
-# Получаем токен из переменных окружения (которые мы прокинем через GitHub Actions)
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = 6176762600
+const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
+const ADMIN_ID = 6176762600;
 
-# Хранилище для связи ID сообщения админа с ID сообщения в группе
-# Формат: {message_id_in_admin_chat: (chat_id, message_id_in_group)}
-msg_map = {}
+// Слушаем сообщения в группах
+bot.on('message', async (msg) => {
+    // Если сообщение от админа - пропускаем, чтобы не зациклить
+    if (msg.chat.id === ADMIN_ID) return;
 
-@dp.message(F.chat.type.in_({'group', 'supergroup'}))
-async def handle_group_messages(message: types.Message):
-    user = message.from_user
-    username = f"@{user.username}" if user.username else user.full_name
-    
-    text = (
-        f"({message.chat.title})\n"
-        f"Пользователь: {username}\n"
-        f"{message.text or '[Медиа/Стикер]'}"
-    )
-    
-    # Отправляем админу
-    sent = await bot.send_message(chat_id=ADMIN_ID, text=text)
-    
-    # Сохраняем привязку для ответа
-    msg_map[sent.message_id] = (message.chat.id, message.message_id)
+    if (msg.chat.type === 'group' || msg.chat.type === 'supergroup') {
+        const username = msg.from.username ? `@${msg.from.username}` : msg.from.first_name;
+        const text = `(${msg.chat.title})\nПользователь: ${username}\n${msg.text || '[Медиа/Стикер]'}`;
 
-@dp.message(F.chat.id == ADMIN_ID, F.reply_to_message)
-async def admin_reply(message: types.Message):
-    reply_id = message.reply_to_message.message_id
-    
-    if reply_id in msg_map:
-        chat_id, target_msg_id = msg_map[reply_id]
-        await bot.send_message(
-            chat_id=chat_id,
-            text=message.text,
-            reply_to_message_id=target_msg_id
-        )
+        const sent = await bot.sendMessage(ADMIN_ID, text);
+        
+        // Пишем в БД: admin_msg_id (ключ) -> группа и original_msg_id
+        await supabase.from('message_mapping').insert([
+            { 
+                admin_msg_id: sent.message_id, 
+                group_chat_id: msg.chat.id, 
+                group_msg_id: msg.message_id 
+            }
+        ]);
+    }
+});
 
-async def main():
-    await dp.start_polling(bot)
+// Слушаем реплаи админа в личке
+bot.on('message', async (msg) => {
+    if (msg.chat.id === ADMIN_ID && msg.reply_to_message) {
+        const { data, error } = await supabase
+            .from('message_mapping')
+            .select('group_chat_id, group_msg_id')
+            .eq('admin_msg_id', msg.reply_to_message.message_id)
+            .single();
 
-if __name__ == "__main__":
-    asyncio.run(main())
-  
+        if (data) {
+            await bot.sendMessage(data.group_chat_id, msg.text, {
+                reply_to_message_id: data.group_msg_id
+            });
+        }
+    }
+});
+
+console.log("Бот успешно запущен и слушает БД...");
